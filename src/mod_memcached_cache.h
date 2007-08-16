@@ -17,22 +17,23 @@
 #ifndef MOD_MEMCACHED_H
 #define MOD_MEMCACHED_H
 
-#define HEADER_IN_PREFIX "hi:"
-#define HEADER_OUT_PREFIX "ho:"
-#define INFO_PREFIX "i:"
-#define BODY_PREFIX "b:"
-#define TEMP_PREFIX "t:"
-
 typedef struct {
-  char *ikey;
-  char *hikey;
-  char *hokey;
-  char *bkey;
-  char *tkey;
-  char *headers;
+  char *info;
+  char *h_in;
+  char *h_out;
   char *body;
+  apr_bucket_brigade *headers_bb;
   apr_bucket_brigade *body_bb;
 } memcached_cache_object_t;
+
+typedef enum {
+  PARSE_UNKNOWN = 0,
+  PARSE_INFO,
+  PARSE_HEADERS_OUT,
+  PARSE_HEADERS_IN,
+  PARSE_BODY
+} parse_state;
+
 /* memcached server stuff */
 
 #define DEFAULT_MAX_SERVERS 10
@@ -51,7 +52,8 @@ typedef struct {
 /* configuration */
 
 typedef struct {
-  /* contains our list of memcached_cache_server_ts */
+
+  /* contains our list of memcached_cache_server_t */
   apr_array_header_t *servers;
   apr_memcache_t *memcache;
   apr_uint32_t min;
