@@ -31,23 +31,21 @@
 
 module AP_MODULE_DECLARE_DATA memcached_cache_module;
 
-
-/*
-  not there yet: 
-  open_entity -> create_entity -> store_headers -> store_body
-
- */
-
 /* provider methods */
 static int create_entity(cache_handle_t *h, request_rec *r, 
                          const char *key, apr_off_t len);
+
 static int remove_entity(cache_handle_t *h);
+static int remove_url(cache_handle_t *h, apr_pool_t *p);
+
 static apr_status_t store_headers(cache_handle_t *h, request_rec *r, 
                                   cache_info *i);
 static apr_status_t store_body(cache_handle_t *h, request_rec *r,
                                apr_bucket_brigade *b);
+
 static apr_status_t recall_headers(cache_handle_t *h, request_rec *r);
-static apr_status_t recall_body(cache_handle_t *h, apr_pool_t *p, apr_bucket_brigade *b);
+static apr_status_t recall_body(cache_handle_t *h, apr_pool_t *p, 
+                                apr_bucket_brigade *b);
 
 static void *memcached_create_config(apr_pool_t *p, server_rec *s)
 {
@@ -55,37 +53,10 @@ static void *memcached_create_config(apr_pool_t *p, server_rec *s)
     apr_pcalloc(p, sizeof(memcached_cache_conf_t));
   
   conf->servers = apr_array_make(p, 10, sizeof(memcached_cache_server_t));
+  conf->min_size = DEFAULT_MIN_SIZE;
+  conf->max_size = DEFAULT_MAX_SIZE;
+
   return conf;
-}
-
-static int headers_debug(void *data, const char *key, const char *value)
-{
-  request_rec *r = data;
-  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-               "%s: %s", key, value);
-
-  return 1;
-}
-
-static parse_state find_state(const char *marker)
-{
-
-  parse_state state;
-
-  if(!strncmp("info", marker, 4)) {
-    state = PARSE_INFO;
-  }
-  else if(!strncmp("hout", marker, 4)) {
-    state = PARSE_HEADERS_OUT;
-  }
-  else if(!strncmp("hin", marker, 3)) {
-    state = PARSE_HEADERS_IN;
-  }
-  else if(!strncmp("body", marker, 4)) {
-    state = PARSE_BODY;
-  }
-
-  return state;
 }
 
 static int create_entity(cache_handle_t *h, request_rec *r, 
@@ -95,25 +66,28 @@ static int create_entity(cache_handle_t *h, request_rec *r,
                                                       &memcached_cache_module);
   cache_object_t *obj;
   memcached_cache_object_t *mobj;
-  char *result; 
-  apr_size_t dlen;
   apr_status_t rv;
 
   h->cache_obj = obj = apr_pcalloc(r->pool, sizeof(cache_object_t));
   obj->vobj = mobj = apr_pcalloc(r->pool, sizeof(memcached_cache_object_t));
 
+  mobj->mc = conf->memcache;
   obj->key = apr_pstrdup(r->pool, key);
   
   mobj->headers_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
   mobj->body_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
-  //rv = apr_memcache_delete(conf->memcache, obj->key, 0);
-  rv = apr_memcache_add(conf->memcache, obj->key, NULL, 0, 5, 0);
+
+  rv = apr_memcache_set(mobj->mc,
+                        apr_pstrcat(r->pool,
+                                    "h:", obj->key, NULL),
+                        NULL, 0, 5, 0);
+
   if(rv != APR_SUCCESS) {
     ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
                  "create_entity: unable to create: %s", key);
-    
     return DECLINED;
   }
+
   ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
                "create_entity: created: %s", key);
   
@@ -127,12 +101,11 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
   cache_object_t *obj;
   memcached_cache_object_t *mobj;
   cache_info *info;
-  char *result;
-  apr_size_t len;
+  char *headers;
   apr_status_t rv;
   apr_table_t *info_table;
   char *token, *ctx;
-
+  int state = 0;
 
   conf = 
     (memcached_cache_conf_t *)ap_get_module_config(r->server->module_config,
@@ -142,6 +115,8 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
   obj->vobj = mobj = apr_pcalloc(r->pool, sizeof(memcached_cache_object_t));
 
   obj->key = apr_pstrdup(r->pool, key);
+
+  mobj->mc = conf->memcache;
   mobj->headers_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
   mobj->body_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
@@ -150,76 +125,61 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
   ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
                "open_entity: %s", key);
 
-  rv = apr_memcache_getp(conf->memcache, r->pool, key,
-                          &result, &len, NULL);
-  if(rv == APR_SUCCESS) {
-    parse_state state = PARSE_UNKNOWN;
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
-                 "open_entity found: %s %s", key, result);
+  rv = apr_memcache_getp(conf->memcache, r->pool, 
+                         apr_pstrcat(r->pool, "h:", key, NULL),
+                         &(mobj->headers), &(mobj->hlen), NULL);
 
-    /*
-    info_table = apr_table_make(r->pool, 5);
-    h->req_hdrs = apr_table_make(r->pool, 20);
-    h->resp_hdrs = apr_table_make(r->pool, 20);
-    
-    while((token = apr_strtok(result, CRLF, &ctx)) != NULL) {
-      char *n, *v, *c;
+  if(rv != APR_SUCCESS) {
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, 
+                 "mod_memcached_cache: no header info found for %s", 
+                 key);
 
-      result = NULL;
+    return DECLINED;
+  }
+
+  rv = apr_memcache_getp(mobj->mc, r->pool, 
+                         apr_pstrcat(r->pool, "b:", key, NULL),
+                         &(mobj->body), &(mobj->blen), NULL);
+
+  if(rv != APR_SUCCESS) {
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, 
+                 "mod_memcached_cache: no body found for %s", 
+                 key);
+
+    return DECLINED;
+  }
   
-      n = apr_pstrdup(r->pool, token);
+  info_table = apr_table_make(r->pool, 5);
+  headers = apr_pstrdup(r->pool, mobj->headers);
+
+  while((token = apr_strtok(headers, CRLF, &ctx)) != NULL) {
+    char *n, *v;
+    
+    headers = NULL;
+    n = apr_pstrdup(r->pool, token);
+    
+    if(strcmp("----", n) == 0) {
+      state++;
+    }
+    if(state == 1) {
       
-      state = find_state(n);
-
-      ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-                   "state: %d for %s", state, n);
-      
-
-      if(state == PARSE_BODY) {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-                 "ctx: %s", ctx);
-
-                break;
-      }
-
       v = strchr(n, ':');
       if(v) {
         *(v++) ='\0';
         
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-                     "parsed: %s %s", n, v);
-          
-        if(state == PARSE_INFO) {
-          ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-                       "setting info: %s %s", n, v);
-
-          apr_table_set(info_table, n, v);
-        }
-        else if(state == PARSE_HEADERS_IN) {
-          apr_table_set(h->req_hdrs, n, v);
-        }
-        else if(state == PARSE_HEADERS_OUT) {
-          apr_table_set(h->resp_hdrs, n, v);
-        }
       }
+      apr_table_set(info_table, n, v);
     }
-
-    apr_table_do(headers_debug, r, info_table, NULL);
-
-    info->status = apr_atoi64(apr_table_get(info_table, "status"));
-    info->date = apr_atoi64(apr_table_get(info_table, "date"));
-    info->expire = apr_atoi64(apr_table_get(info_table, "expire"));
-    info->request_time = apr_atoi64(apr_table_get(info_table, "request_time"));
-    info->response_time = apr_atoi64(apr_table_get(info_table, "response_time"));
-    */
-    return OK;
-  }
-  else {
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
-                 "open_entity not found: %s", key);
+    
   }
   
-  return DECLINED;
+  info->status = apr_atoi64(apr_table_get(info_table, "status"));
+  info->date = apr_atoi64(apr_table_get(info_table, "date"));
+  info->expire = apr_atoi64(apr_table_get(info_table, "expire"));
+  info->request_time = apr_atoi64(apr_table_get(info_table, "request_time"));
+  info->response_time = apr_atoi64(apr_table_get(info_table, "response_time"));
+
+  return OK;
 }
 
 static int remove_entity(cache_handle_t *h)
@@ -227,12 +187,46 @@ static int remove_entity(cache_handle_t *h)
 
   h->cache_obj = NULL;
   
-  /*
-  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-               "remove_entity");
-  */
   return OK;
 
+}
+
+static apr_status_t remove_url(cache_handle_t *h, apr_pool_t *p)
+{
+
+  apr_status_t rv;
+  cache_object_t *obj = h->cache_obj;
+  memcached_cache_object_t *mobj = (memcached_cache_object_t *) obj->vobj;
+
+  ap_log_perror(APLOG_MARK, APLOG_DEBUG, 0, p,
+                "remove_url");
+
+  rv = apr_memcache_delete(mobj->mc, 
+                           apr_pstrcat(p, "h:", obj->key, NULL), 
+                           0);
+
+  /* if it wasn't successful, and it wasn't just because the object was no 
+   *  longer found (maybe it LRU'ed out or something), then return DECLINED
+  */
+  if(rv != APR_SUCCESS && 
+     rv != APR_NOTFOUND) {
+    ap_log_perror(APLOG_MARK, APLOG_ERR, rv, p, 
+                  "unable to remove headers for %s", obj->key);
+    return DECLINED;
+  }
+
+  rv = apr_memcache_delete(mobj->mc, 
+                           apr_pstrcat(p, "b:", obj->key, NULL), 
+                           0);
+
+  if(rv != APR_SUCCESS && 
+     rv != APR_NOTFOUND) {
+    ap_log_perror(APLOG_MARK, APLOG_ERR, rv, p, 
+                  "unable to remove body for %s", obj->key);
+    return DECLINED;
+  }
+
+  return OK;
 }
 
 /* shove formatted data into a bucket brigade */
@@ -255,13 +249,16 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
   apr_status_t rv;
   cache_object_t *obj = h->cache_obj;
   apr_bucket *e;
-  char *token;
+  char *headers;
+  apr_size_t hlen;
   memcached_cache_object_t *mobj = 
     (memcached_cache_object_t *) h->cache_obj->vobj;
-  memcached_cache_conf_t *conf = ap_get_module_config(r->server->module_config,
-                                                      &memcached_cache_module);
+  memcached_cache_conf_t *conf;
   apr_bucket_alloc_t *bucket_alloc = r->connection->bucket_alloc;
   
+  conf = ap_get_module_config(r->server->module_config,
+                              &memcached_cache_module);
+
   ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
                "store_headers");
 
@@ -279,22 +276,25 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
     obj->info.expire = info->expire;
   }
 
-  e = apr_bucket_immortal_create("info\r\n", 6, bucket_alloc);
+  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
   APR_BRIGADE_INSERT_HEAD(mobj->headers_bb, e);
 
   rv = _serialize(mobj->headers_bb,
-                  "status: %d\r\ndate: %"APR_TIME_T_FMT"\r\nresponse_time: %"APR_TIME_T_FMT"\r\nrequest_time: %"APR_TIME_T_FMT"\r\nexpire: %"APR_TIME_T_FMT"\r\n",
+                  "status:%d\r\ndate: %"APR_TIME_T_FMT"\r\nresponse_time:%"APR_TIME_T_FMT"\r\nrequest_time:%"APR_TIME_T_FMT"\r\nexpire:%"APR_TIME_T_FMT"\r\n",
                   info->status,
                   info->date,
                   info->response_time,
                   info->request_time,
                   info->expire);
 
+  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
+
   if(r->headers_out) {
     apr_table_t *headers_out;
     apr_table_entry_t *elts;
     int i;
-
+    
     headers_out = ap_cache_cacheable_hdrs_out(r->pool, r->headers_out,
                                               r->server);
     if (!apr_table_get(headers_out, "Content-Type")
@@ -305,39 +305,50 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
     
     headers_out = apr_table_overlay(r->pool, headers_out,
                                     r->err_headers_out);
-
-    e = apr_bucket_immortal_create("hout\r\n", 6, bucket_alloc);
-    APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
-
+      
     elts = (apr_table_entry_t *) apr_table_elts(headers_out)->elts;
     for( i = 0; i < apr_table_elts(headers_out)->nelts; i++) {
       rv = _serialize(mobj->headers_bb, 
                       "%s: %s\r\n",
                       elts[i].key, elts[i].val);
+      
     }
-    
-    if(r->headers_in) {
-      apr_table_t *headers_in;
-      apr_table_entry_t *elts;
-      int i;
-      
-      headers_in = ap_cache_cacheable_hdrs_out(r->pool, r->headers_in,
-                                               r->server);
+  }    
 
-      e = apr_bucket_immortal_create("hin\r\n", 5, bucket_alloc);
-      APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
-      
-      elts = (apr_table_entry_t *) apr_table_elts(headers_in)->elts;
-      for( i = 0; i < apr_table_elts(headers_in)->nelts; i++) {
-        rv = _serialize(mobj->headers_bb, 
-                        "%s: %s\r\n",
-                        elts[i].key, elts[i].val);
-      }
+  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
+  
+  if(r->headers_in) {
+    apr_table_t *headers_in;
+    apr_table_entry_t *elts;
+    int i;
+    
+    headers_in = ap_cache_cacheable_hdrs_out(r->pool, r->headers_in,
+                                             r->server);
+    
+    elts = (apr_table_entry_t *) apr_table_elts(headers_in)->elts;
+    for( i = 0; i < apr_table_elts(headers_in)->nelts; i++) {
+      rv = _serialize(mobj->headers_bb, 
+                      "%s: %s\r\n",
+                      elts[i].key, elts[i].val);
     }
   }
-  
+
   e = apr_bucket_eos_create(bucket_alloc);
   APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
+
+  rv = apr_brigade_pflatten(mobj->headers_bb, &headers, &hlen, r->pool);
+
+  rv = apr_memcache_set(mobj->mc,
+                        apr_pstrcat(r->pool, "h:", obj->key, NULL),
+                        headers, hlen, 0, 0);
+
+  if(rv != APR_SUCCESS) {
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
+                 "store_headers: storage failed");
+    
+    return rv;
+  }
   
   return APR_SUCCESS;
 }
@@ -349,14 +360,11 @@ static apr_status_t store_body(cache_handle_t *h, request_rec *r,
   apr_bucket *e;
   cache_object_t *obj = h->cache_obj;
   memcached_cache_object_t *mobj = (memcached_cache_object_t *)obj->vobj;
-  char *tmpkey, *realkey;
-  char *stored, *flat, *new;
-  apr_size_t slen, flen, nlen;
-  memcached_cache_conf_t *conf = ap_get_module_config(r->server->module_config,
-                                                      &memcached_cache_module);
-
-  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-               "store_body");
+  memcached_cache_conf_t *conf;
+  apr_bucket_alloc_t *bucket_alloc = r->connection->bucket_alloc;
+  
+  conf = ap_get_module_config(r->server->module_config,
+                              &memcached_cache_module);
 
   for(e = APR_BRIGADE_FIRST(bb);
       e != APR_BRIGADE_SENTINEL(bb);
@@ -371,24 +379,48 @@ static apr_status_t store_body(cache_handle_t *h, request_rec *r,
     char *body;
     apr_bucket *e;
     apr_size_t blen;
+
+    e = apr_bucket_eos_create(bucket_alloc);
+    APR_BRIGADE_INSERT_TAIL(mobj->body_bb, e);
     
-    e = apr_bucket_immortal_create("body\r\n", 6, mobj->body_bb->bucket_alloc);
-    APR_BRIGADE_INSERT_HEAD(mobj->body_bb, e);
-
-    APR_BRIGADE_CONCAT(mobj->headers_bb, mobj->body_bb);
-
-    rv = apr_brigade_pflatten(mobj->headers_bb, &body, &blen, r->pool);
+    rv = apr_brigade_pflatten(mobj->body_bb, &body, &blen, r->pool);
     if(rv != APR_SUCCESS) {
       ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
                    "store_body: pflatten failed");
 
       return rv;
     }
+    
+    if(blen > conf->max_size) {
+      ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
+                   "content for %s is greater than the max size"
+                   "(%" APR_SIZE_T_FMT " > %" APR_OFF_T_FMT ")",
+                   obj->key, blen, conf->max_size);
+      rv = apr_memcache_delete(mobj->mc, 
+                               apr_pstrcat(r->pool, "h:", obj->key, NULL),
+                               0);
+      return APR_EGENERAL;
+    }
 
-    //ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-    //"store_body: %s", body);
+    if(blen < conf->min_size) {
+      ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
+                   "content for %s is smaller than the min size"
+                   "(%" APR_SIZE_T_FMT " < %" APR_OFF_T_FMT ")",
+                   obj->key, blen, conf->min_size);
+      rv = apr_memcache_delete(mobj->mc, 
+                               apr_pstrcat(r->pool, "h:", obj->key, NULL),
+                               0);
+      return APR_EGENERAL;
+    }
 
-    rv = apr_memcache_set(conf->memcache, obj->key, body, blen, 7, 0);
+    rv = apr_memcache_set(mobj->mc,
+                          apr_pstrcat(r->pool,
+                                      "b:", obj->key, NULL),
+                          body, blen, 0, 0);
+
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
+                 "store_body");
+
     if(rv != APR_SUCCESS) {
       ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
                    "store_body: storage failed");
@@ -401,63 +433,56 @@ static apr_status_t store_body(cache_handle_t *h, request_rec *r,
 }
 
 
-
 static apr_status_t recall_headers(cache_handle_t *h, request_rec *r)
 {
-  memcached_cache_conf_t *conf = ap_get_module_config(r->server->module_config,
-                                                      &memcached_cache_module);
+  memcached_cache_conf_t *conf;
   cache_object_t *obj = h->cache_obj;
   memcached_cache_object_t *mobj = (memcached_cache_object_t *)obj->vobj;
   char *result;
   apr_status_t rv;
   apr_size_t len;
-  parse_state state = PARSE_UNKNOWN;
-  int i = 0;
-  char *hokey, *hikey, *token;
+  char *token;
   char *ctx;
+  int state;
+
+  conf = ap_get_module_config(r->server->module_config,
+                              &memcached_cache_module);
 
   ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
                "recall_headers: %s", obj->key);
 
-  rv = apr_memcache_getp(conf->memcache, r->pool, obj->key, 
-                         &result, &len, NULL);
+  rv = apr_memcache_getp(mobj->mc, r->pool, 
+                         apr_pstrcat(r->pool, "h:", obj->key, NULL),
+                          &result, &len, NULL);
 
   h->req_hdrs = apr_table_make(r->pool, 20);
   h->resp_hdrs = apr_table_make(r->pool, 20);
 
-  while((token = apr_strtok(result, CRLF, &ctx)) != NULL) {
-    char *n, *v, *c;
-
-    result = NULL;
-  
+  while((token = apr_strtok(mobj->headers, CRLF, &ctx)) != NULL) {
+    char *n, *v;
+    
+    mobj->headers = NULL;
+    
     n = apr_pstrdup(r->pool, token);
-    state = find_state(n);
-
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-                 "state: %d", state);
-
-    if(state == PARSE_BODY) {
-      //      ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, 
-      //           "ctx: %s", ctx);
-
-      break;
+    
+    if(strcmp("----", n) == 0) {
+      state++;
     }
-    v = strchr(n, ':');
-    if(v) {
-        *(v++) ='\0';
+    else {
+      v = strchr(n, ':');
+      if(v) {
+        *(v++) = '\0';
+      }
+      v++; /* to get rid of the leading space */
 
-        if(state == PARSE_INFO) {
-        }
-        else if(state == PARSE_HEADERS_IN) {
-          apr_table_set(h->req_hdrs, n, v);
-        }
-        else if(state == PARSE_HEADERS_OUT) {
-          apr_table_set(h->resp_hdrs, n, v);
-        }
+      if(state == 2) {
+        apr_table_set(h->req_hdrs, n, v);
+      }
+      else if(state == 3) {
+        apr_table_set(h->resp_hdrs, n, v);
+      }
     }
-  }
-  
-  //apr_table_do(headers_debug, r, h->resp_hdrs, NULL);
+  } 
 
   return APR_SUCCESS;
 }
@@ -467,35 +492,30 @@ static apr_status_t recall_body(cache_handle_t *h, apr_pool_t *p,
 {
 
   apr_bucket *e;
+  char *body;
+  apr_size_t len;
+  apr_status_t rv;
+  cache_object_t *obj = h->cache_obj;
+  memcached_cache_object_t *mobj = (memcached_cache_object_t *) obj->vobj;
+
   ap_log_perror(APLOG_MARK, APLOG_DEBUG, 0, p,
                "recall_body");
 
+  rv = apr_memcache_getp(mobj->mc, p, 
+                         apr_pstrcat(p, "b:", obj->key, NULL),
+                         &body, &len, NULL);
 
-  e = apr_bucket_heap_create("foo", sizeof("foo") - 1, NULL, 
-                             bb->bucket_alloc);
+  e = apr_bucket_heap_create(body, len, NULL, bb->bucket_alloc);
 
   APR_BRIGADE_INSERT_HEAD(bb, e);
   e = apr_bucket_eos_create(bb->bucket_alloc);
   APR_BRIGADE_INSERT_TAIL(bb, e);
 
   return APR_SUCCESS;
-
 }
 
-static apr_status_t remove_url(cache_handle_t *h, apr_pool_t *p)
-{
 
-  apr_status_t rv;
-  cache_object_t *obj = h->cache_obj;
-  memcached_cache_object_t *mobj = (memcached_cache_object_t *) obj->vobj;
-
-  ap_log_perror(APLOG_MARK, APLOG_DEBUG, 0, p,
-                "remove_url: ");
-
-  return OK;
-}
-
-static const char *add_cache_server(cmd_parms *parms, void *ptr, 
+static const char *add_cache_server(cmd_parms *parms, void *dummy,
                                     const char *host, const char *port)
 {
   
@@ -508,6 +528,36 @@ static const char *add_cache_server(cmd_parms *parms, void *ptr,
   s->host = apr_pstrdup(parms->pool, host);
   s->port = apr_atoi64(port);
   
+  return NULL;
+}
+
+static const char *set_mccache_min_size(cmd_parms *parms, void *dummy,
+                                        const char *min)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+  if(apr_strtoff(&conf->min_size, min, NULL, 0) != APR_SUCCESS ||
+     conf->min_size < 0) {
+    
+    return "MemcachedCacheMinFileSize should be a numeric value in bytes that specifies the minimum size of a document to store";
+
+  }
+  return NULL;
+}
+
+static const char *set_mccache_max_size(cmd_parms *parms, void *dummy, 
+                                        const char *max)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+    if(apr_strtoff(&conf->max_size, max, NULL, 0) != APR_SUCCESS ||
+     conf->max_size < 0) {
+    
+    return "MemcachedCacheMaxFileSize should be a numeric value in bytes that specifies the maximum size of a document to store";
+
+  }
   return NULL;
 }
 
@@ -547,7 +597,7 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog,
                      svr[i].host, svr[i].port);
         continue;
       }    
-      
+     
       rv = apr_memcache_add_server(conf->memcache, svr[i].server);
       if(rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, sp, 
@@ -559,11 +609,16 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog,
   return OK;
 }
 
-
 static const command_rec memcached_cmds[] = 
 {
-  AP_INIT_TAKE2("MemcacheCacheServer", add_cache_server, NULL, RSRC_CONF,
+  AP_INIT_TAKE2("MemcachedCacheServer", add_cache_server, NULL, RSRC_CONF,
                 "bleh"),
+  AP_INIT_TAKE1("MemcachedCacheMinFileSize", set_mccache_min_size, NULL, 
+                RSRC_CONF, 
+                "The minimum file size required to cache a document"),
+  AP_INIT_TAKE1("MemcachedCacheMaxFileSize", set_mccache_max_size, NULL,
+                RSRC_CONF, 
+                "The maximum file size required to cache a document"),
 
   {NULL}
 };

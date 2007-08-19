@@ -1,3 +1,15 @@
 mod_memcached_cache
 ----------------
 
+This module allows an Apache 2.2.x instance to use one or more
+memcached instances for HTTP 1.1 document caching, in addition to or
+instead of the modules distributed with Apache for file and in-process
+memory caching.
+
+
+Apache doesn't install mod_cache.h into a default include directory,
+so you will need to do something like this when you run configure so
+that it can be found:
+
+CFLAGS=-I/path/to/apache/src/httpd-2.2.4/modules/cache ./configure ...
+

@@ -19,27 +19,21 @@
 
 typedef struct {
   char *info;
-  char *h_in;
-  char *h_out;
+  char *headers;
   char *body;
+  apr_size_t hlen;
+  apr_size_t blen;
   apr_bucket_brigade *headers_bb;
   apr_bucket_brigade *body_bb;
+  apr_memcache_t *mc;
 } memcached_cache_object_t;
-
-typedef enum {
-  PARSE_UNKNOWN = 0,
-  PARSE_INFO,
-  PARSE_HEADERS_OUT,
-  PARSE_HEADERS_IN,
-  PARSE_BODY
-} parse_state;
 
 /* memcached server stuff */
 
 #define DEFAULT_MAX_SERVERS 10
-#define DEFAULT_MIN 2
-#define DEFAULT_SMAX 6
-#define DEFAULT_MAX 10
+#define DEFAULT_MIN 5
+#define DEFAULT_SMAX 10
+#define DEFAULT_MAX 15
 #define DEFAULT_TTL 10
 
 typedef struct {
@@ -51,6 +45,9 @@ typedef struct {
 
 /* configuration */
 
+#define DEFAULT_MIN_SIZE 1
+#define DEFAULT_MAX_SIZE 1048576
+
 typedef struct {
 
   /* contains our list of memcached_cache_server_t */
@@ -60,6 +57,8 @@ typedef struct {
   apr_uint32_t smax;
   apr_uint32_t max;
   apr_uint32_t ttl;
+  apr_off_t min_size;
+  apr_off_t max_size;
 } memcached_cache_conf_t;
 
 #endif /* MOD_MEMCACHED_H */
