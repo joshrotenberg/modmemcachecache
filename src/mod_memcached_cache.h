@@ -19,13 +19,13 @@
 
 typedef struct {
   char *info;
-  char *headers;
   char *body;
-  apr_size_t hlen;
   apr_size_t blen;
   apr_bucket_brigade *headers_bb;
   apr_bucket_brigade *body_bb;
   apr_memcache_t *mc;
+  apr_table_t *req_hdrs;
+  apr_table_t *resp_hdrs;
 } memcached_cache_object_t;
 
 /* memcached server stuff */
@@ -52,11 +52,13 @@ typedef struct {
 
   /* contains our list of memcached_cache_server_t */
   apr_array_header_t *servers;
+  
   apr_memcache_t *memcache;
-  apr_uint32_t min;
-  apr_uint32_t smax;
-  apr_uint32_t max;
-  apr_uint32_t ttl;
+  apr_uint32_t conn_min;
+  apr_uint32_t conn_smax;
+  apr_uint32_t conn_max;
+  apr_uint32_t conn_ttl;
+  apr_uint32_t max_servers;
   apr_off_t min_size;
   apr_off_t max_size;
 } memcached_cache_conf_t;

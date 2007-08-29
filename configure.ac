@@ -1,5 +1,5 @@
 dnl adjust for the name and version of your 
-AC_INIT(mod_memcached, 0.1.0)
+AC_INIT(mod_memcached_cache, 0.1.0)
 MAKE_CONFIG_NICE(config.nice)
 AC_PREREQ(2.53)
 dnl adjust for your main source file name

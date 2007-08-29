@@ -19,7 +19,7 @@
  * author: josh rotenberg 
  *
  * This module implements file caching for busy static files into one (or more)
- * memcached servers configured to store data. 
+ * memcached servers.
  *
 */
 
@@ -56,6 +56,12 @@ static void *memcached_create_config(apr_pool_t *p, server_rec *s)
   conf->min_size = DEFAULT_MIN_SIZE;
   conf->max_size = DEFAULT_MAX_SIZE;
 
+  conf->max_servers = DEFAULT_MAX_SERVERS;
+  conf->conn_min = DEFAULT_MIN;
+  conf->conn_smax = DEFAULT_SMAX;
+  conf->conn_max = DEFAULT_MAX;
+  conf->conn_ttl = DEFAULT_TTL;
+
   return conf;
 }
 
@@ -78,12 +84,11 @@ static int create_entity(cache_handle_t *h, request_rec *r,
   mobj->body_bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
   rv = apr_memcache_set(mobj->mc,
-                        apr_pstrcat(r->pool,
-                                    "h:", obj->key, NULL),
-                        NULL, 0, 5, 0);
+                        apr_pstrcat(r->pool, "h:", obj->key, NULL),
+                        NULL, 0, 0, 0);
 
   if(rv != APR_SUCCESS) {
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server,
+    ap_log_error(APLOG_MARK, APLOG_ERR, rv, r->server,
                  "create_entity: unable to create: %s", key);
     return DECLINED;
   }
@@ -102,6 +107,7 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
   memcached_cache_object_t *mobj;
   cache_info *info;
   char *headers;
+  apr_size_t hlen;
   apr_status_t rv;
   apr_table_t *info_table;
   char *token, *ctx;
@@ -122,16 +128,18 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
 
   info = &(obj->info);
 
-  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-               "open_entity: %s", key);
+  /* look for the header and body items in the memcache server(s). if both
+     are not found this cached item isn't complete, return declined and
+     let mod_cache decide what to do next.
+  */
 
   rv = apr_memcache_getp(conf->memcache, r->pool, 
                          apr_pstrcat(r->pool, "h:", key, NULL),
-                         &(mobj->headers), &(mobj->hlen), NULL);
+                         &headers, &hlen, NULL);
 
   if(rv != APR_SUCCESS) {
     ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, 
-                 "mod_memcached_cache: no header info found for %s", 
+                 "open_entity: no header info found for %s", 
                  key);
 
     return DECLINED;
@@ -143,36 +151,60 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
 
   if(rv != APR_SUCCESS) {
     ap_log_error(APLOG_MARK, APLOG_DEBUG, rv, r->server, 
-                 "mod_memcached_cache: no body found for %s", 
+                 "open_entity: no body found for %s", 
                  key);
 
     return DECLINED;
   }
-  
-  info_table = apr_table_make(r->pool, 5);
-  headers = apr_pstrdup(r->pool, mobj->headers);
 
+  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
+               "open_entity: found data for %s", key);  
+
+  info_table = apr_table_make(r->pool, 5);
+  /*
+    this is really the job of recall_headers, but we are already here
+     parsing this stuff out.
+  */
+  mobj->req_hdrs = apr_table_make(r->pool, 20);
+  mobj->resp_hdrs = apr_table_make(r->pool, 20);
+
+  /* parse the info out of the item */
   while((token = apr_strtok(headers, CRLF, &ctx)) != NULL) {
     char *n, *v;
     
     headers = NULL;
     n = apr_pstrdup(r->pool, token);
-    
+
+    /* 
+       if a separator is found, increment the state and skip on to the next
+       line.
+    */
     if(strcmp("----", n) == 0) {
       state++;
+      continue;
     }
+
+    /* otherwise, parse and populate */
+    v = strchr(n, ':');
+    if(v) {
+      *(v++) = '\0';
+    }
+    v++;
+
     if(state == 1) {
-      
-      v = strchr(n, ':');
-      if(v) {
-        *(v++) ='\0';
-        
-      }
       apr_table_set(info_table, n, v);
     }
-    
+    else if(state == 2) {
+      apr_table_set(mobj->req_hdrs, n, v);
+    }
+    else if(state == 3) {
+      apr_table_set(mobj->resp_hdrs, n, v);
+    }
   }
   
+  /* populate the info struct with what was found. this should probably
+     check the values better 
+  */
   info->status = apr_atoi64(apr_table_get(info_table, "status"));
   info->date = apr_atoi64(apr_table_get(info_table, "date"));
   info->expire = apr_atoi64(apr_table_get(info_table, "expire"));
@@ -280,7 +312,11 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
   APR_BRIGADE_INSERT_HEAD(mobj->headers_bb, e);
 
   rv = _serialize(mobj->headers_bb,
-                  "status:%d\r\ndate: %"APR_TIME_T_FMT"\r\nresponse_time:%"APR_TIME_T_FMT"\r\nrequest_time:%"APR_TIME_T_FMT"\r\nexpire:%"APR_TIME_T_FMT"\r\n",
+                  "status: %d\r\n"
+                  "date: %"APR_TIME_T_FMT"\r\n"
+                  "response_time: %"APR_TIME_T_FMT"\r\n"
+                  "request_time: %"APR_TIME_T_FMT"\r\n"
+                  "expire: %"APR_TIME_T_FMT"\r\n",
                   info->status,
                   info->date,
                   info->response_time,
@@ -438,51 +474,10 @@ static apr_status_t recall_headers(cache_handle_t *h, request_rec *r)
   memcached_cache_conf_t *conf;
   cache_object_t *obj = h->cache_obj;
   memcached_cache_object_t *mobj = (memcached_cache_object_t *)obj->vobj;
-  char *result;
   apr_status_t rv;
-  apr_size_t len;
-  char *token;
-  char *ctx;
-  int state;
 
-  conf = ap_get_module_config(r->server->module_config,
-                              &memcached_cache_module);
-
-  ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
-               "recall_headers: %s", obj->key);
-
-  rv = apr_memcache_getp(mobj->mc, r->pool, 
-                         apr_pstrcat(r->pool, "h:", obj->key, NULL),
-                          &result, &len, NULL);
-
-  h->req_hdrs = apr_table_make(r->pool, 20);
-  h->resp_hdrs = apr_table_make(r->pool, 20);
-
-  while((token = apr_strtok(mobj->headers, CRLF, &ctx)) != NULL) {
-    char *n, *v;
-    
-    mobj->headers = NULL;
-    
-    n = apr_pstrdup(r->pool, token);
-    
-    if(strcmp("----", n) == 0) {
-      state++;
-    }
-    else {
-      v = strchr(n, ':');
-      if(v) {
-        *(v++) = '\0';
-      }
-      v++; /* to get rid of the leading space */
-
-      if(state == 2) {
-        apr_table_set(h->req_hdrs, n, v);
-      }
-      else if(state == 3) {
-        apr_table_set(h->resp_hdrs, n, v);
-      }
-    }
-  } 
+  h->req_hdrs = apr_table_copy(r->pool, mobj->req_hdrs);
+  h->resp_hdrs = apr_table_copy(r->pool, mobj->resp_hdrs);
 
   return APR_SUCCESS;
 }
@@ -516,16 +511,29 @@ static apr_status_t recall_body(cache_handle_t *h, apr_pool_t *p,
 
 
 static const char *add_cache_server(cmd_parms *parms, void *dummy,
-                                    const char *host, const char *port)
+                                    const char *server)
 {
-  
+  char *host, *port;
+  memcached_cache_server_t *s = NULL;  
   memcached_cache_conf_t *conf = 
     ap_get_module_config(parms->server->module_config,
                          &memcached_cache_module);
-  memcached_cache_server_t *s = NULL;
+
+  host = apr_pstrdup(parms->pool, server);
+
+  port = strchr(host, ':');
+  if(port) {
+    *(port++) = '\0';
+  }
+
+  if(!*host || host == NULL || 
+     !*port || port == NULL) {
+    return "MemcachedCacheServer should be one or more servers in the format"
+      " host:port";
+  }
 
   s = apr_array_push(conf->servers);
-  s->host = apr_pstrdup(parms->pool, host);
+  s->host = host;
   s->port = apr_atoi64(port);
   
   return NULL;
@@ -558,6 +566,66 @@ static const char *set_mccache_max_size(cmd_parms *parms, void *dummy,
     return "MemcachedCacheMaxFileSize should be a numeric value in bytes that specifies the maximum size of a document to store";
 
   }
+  return NULL;
+}
+
+static const char *set_mc_max_servers(cmd_parms *parms, void *dummy, 
+                                      const char *max)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+
+  conf->max_servers = atoi(max);
+
+  return NULL;
+}
+
+static const char *set_mc_min_conn(cmd_parms *parms, void *dummy,
+                                   const char *min)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+
+  conf->conn_min = atoi(min);
+
+  return NULL;
+}
+
+static const char *set_mc_smax_conn(cmd_parms *parms, void *dummy,
+                                   const char *smax)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+
+  conf->conn_smax = atoi(smax);
+
+  return NULL;
+}
+
+static const char *set_mc_max_conn(cmd_parms *parms, void *dummy,
+                                   const char *max)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+  
+  conf->conn_max = atoi(max);
+
+  return NULL;
+}
+
+static const char *set_mc_conn_ttl(cmd_parms *parms, void *dummy,
+                                   const char *ttl)
+{
+  memcached_cache_conf_t *conf = 
+    ap_get_module_config(parms->server->module_config,
+                         &memcached_cache_module);
+  
+  conf->conn_ttl = atoi(ttl);
+   
   return NULL;
 }
 
@@ -611,14 +679,31 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog,
 
 static const command_rec memcached_cmds[] = 
 {
-  AP_INIT_TAKE2("MemcachedCacheServer", add_cache_server, NULL, RSRC_CONF,
-                "bleh"),
+  AP_INIT_ITERATE("MemcachedCacheServer", add_cache_server, NULL, RSRC_CONF,
+                "Add a memcached host and port to the pool"),
   AP_INIT_TAKE1("MemcachedCacheMinFileSize", set_mccache_min_size, NULL, 
                 RSRC_CONF, 
                 "The minimum file size required to cache a document"),
   AP_INIT_TAKE1("MemcachedCacheMaxFileSize", set_mccache_max_size, NULL,
                 RSRC_CONF, 
                 "The maximum file size required to cache a document"),
+
+  
+  AP_INIT_TAKE1("MemcachedMaxServers", set_mc_max_servers, NULL,
+                RSRC_CONF, 
+                "The maximum number of allowed cache servers"),
+  AP_INIT_TAKE1("MemcachedMinConnections", set_mc_min_conn, NULL,
+                RSRC_CONF, 
+                "The minimum number of connections to open (per server)"),
+  AP_INIT_TAKE1("MemcachedSMaxConnections", set_mc_smax_conn, NULL,
+                RSRC_CONF, 
+                "The soft maximum number of connections to open (per server)"),
+  AP_INIT_TAKE1("MemcachedMaxConnections", set_mc_max_conn, NULL,
+                RSRC_CONF, 
+                "The hard maximum number of connections to open (per server)"),
+  AP_INIT_TAKE1("MemcachedConnectionTTL", set_mc_conn_ttl, NULL,
+                RSRC_CONF, 
+                "The hard maximum number of connections to open (per server)"),
 
   {NULL}
 };
