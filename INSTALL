@@ -1,1 +1,35 @@
+Requirements
+-----------------------
+
+* Apache
+
+I've been developing using Apache 2.2.4 and now 2.2.6, on recent
+versions of both Mac OS X and Linux.
+
+
+* apr_memcache
+
+mod_memcached_cache uses apr_memcache routines for interacting with
+memcached servers. apr_memcache is included in newer development
+branches of APR-Util, but is not available in the current released
+versions (up to and including apr-util-1.2.9). 
+
+Your options are to install a more recent version of APR-Util from
+http://apr.apache.org/, or install apr_memcache-0.7.0, available from
+http://www.outoforder.cc/projects/libs/apr_memcache/
+
+
+Building and Installing
+-----------------------
+
+Apache doesn't install mod_cache.h into a default include directory,
+so you will need to add it to the include path as seen below:
+
+    $ CFLAGS=-I/path/to/apache/src/httpd-2.2.4/modules/cache \
+      ./configure --with-apxs=/path/to/apache2/bin/apxs \
+                  --with-apr-memcach=/path/to/apr_memcache 
+    $ make 
+    $ make install
+
+ 
 
