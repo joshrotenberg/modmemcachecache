@@ -17,6 +17,7 @@
 #ifndef MOD_MEMCACHED_H
 #define MOD_MEMCACHED_H
 
+#define META_SEP "-----\r\n"
 typedef struct {
   char *info;
   char *body;
