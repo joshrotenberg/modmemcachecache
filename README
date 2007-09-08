@@ -2,20 +2,38 @@ mod_memcached_cache
 -------------------
 
 This module allows an Apache 2.2.x instance to use one or more
-memcached instances for HTTP 1.1 document caching, in addition to/instead 
-of the modules distributed with Apache for file and in-process memory caching.
-
-
+memcached instances for HTTP 1.1 document caching, in addition
+to/instead of the modules distributed with Apache for file and
+in-process memory caching. 
 
 Installation
 -------------------
 
 See INSTALL for details.
 
+Implementation
+-------------------
+
+My guess is that mod_memcached_cache will be useful in conjunction
+with one or both of the bundled caching modules: 
+
+On the plus side, it allows more than one Apache server to serve the
+same cached data, so that, for example, a group of servers behind a
+reverse proxy can have a high cache hit rate for requests because once
+one server caches a document, its cached for them all. Similarly, that
+proxy server itself could potentially skip requests to those backend
+servers more often because they, too, are working to keep requests
+cached.
+
+The downside is that each cache hit still requires two memcached
+requests, which won't be as fast as in process memory (with
+mod_mem_cache). I haven't benchmarked the difference between a
+mod_memcached_cache hit and a mod_disk_cache hit.
 
 Configuration
 -------------------
-# in your httpd.conf, or including by it 
+
+# in your httpd.conf
 
 # load 'em up.
 LoadModule cache_module modules/mod_cache.so

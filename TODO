@@ -5,3 +5,5 @@
 * enable separate server lists for meta data and body data?
 
 * enable optional split or all in one storage?
+
+* allow configurable timeouts for memcached objects. 
