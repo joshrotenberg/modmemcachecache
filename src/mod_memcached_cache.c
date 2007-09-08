@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
+
 /*
  * mod_memcached: Memcached backed HTTP 1.1 Cache.
  * author: josh rotenberg 
  *
- * This module implements file caching for busy static files into one (or more)
- * memcached servers.
+ * This module implements HTTP caching using (or more)
+ * memcached servers. 
+ * 
+ * A single URI is cached in two separate objects, one for the cache_info, 
+ * request and response headers, prefixed by 'h:', and one for the content, 
+ * prefixed by 'b:'.
  *
 */
 
@@ -179,17 +184,21 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
        if a separator is found, increment the state and skip on to the next
        line.
     */
-    if(strcmp("----", n) == 0) {
+
+    if(strcmp("-----", n) == 0) {
       state++;
       continue;
     }
 
-    /* otherwise, parse and populate */
-    v = strchr(n, ':');
-    if(v) {
-      *(v++) = '\0';
+    /* otherwise, parse and populate the tables */
+    if(!(v = strchr(n, ':'))) {
+      return APR_EGENERAL;
     }
-    v++;
+
+    *v++ = '\0';
+    while(*v && apr_isspace(*v)) {
+      v++;
+    }
 
     if(state == 1) {
       apr_table_set(info_table, n, v);
@@ -220,7 +229,6 @@ static int remove_entity(cache_handle_t *h)
   h->cache_obj = NULL;
   
   return OK;
-
 }
 
 static apr_status_t remove_url(cache_handle_t *h, apr_pool_t *p)
@@ -262,7 +270,7 @@ static apr_status_t remove_url(cache_handle_t *h, apr_pool_t *p)
 }
 
 /* shove formatted data into a bucket brigade */
-static apr_status_t _serialize(apr_bucket_brigade *bb,
+static apr_status_t _brigadize(apr_bucket_brigade *bb,
                                const char *fmt,
                                ...)
 {
@@ -294,24 +302,10 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
   ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server,
                "store_headers");
 
-  obj->info.status = info->status;
-  if (info->date) {
-    obj->info.date = info->date;
-  }
-  if (info->response_time) {
-    obj->info.response_time = info->response_time;
-  }
-  if (info->request_time) {
-    obj->info.request_time = info->request_time;
-  }
-  if (info->expire) {
-    obj->info.expire = info->expire;
-  }
+  e = apr_bucket_immortal_create(META_SEP, sizeof(META_SEP) -1, bucket_alloc);
+  APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
 
-  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
-  APR_BRIGADE_INSERT_HEAD(mobj->headers_bb, e);
-
-  rv = _serialize(mobj->headers_bb,
+  rv = _brigadize(mobj->headers_bb,
                   "status: %d\r\n"
                   "date: %"APR_TIME_T_FMT"\r\n"
                   "response_time: %"APR_TIME_T_FMT"\r\n"
@@ -323,7 +317,7 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
                   info->request_time,
                   info->expire);
 
-  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
+  e = apr_bucket_immortal_create(META_SEP, sizeof(META_SEP) -1, bucket_alloc);
   APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
 
   if(r->headers_out) {
@@ -344,16 +338,16 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
       
     elts = (apr_table_entry_t *) apr_table_elts(headers_out)->elts;
     for( i = 0; i < apr_table_elts(headers_out)->nelts; i++) {
-      rv = _serialize(mobj->headers_bb, 
+      rv = _brigadize(mobj->headers_bb, 
                       "%s: %s\r\n",
                       elts[i].key, elts[i].val);
       
     }
   }    
 
-  e = apr_bucket_immortal_create("----\r\n", 6, bucket_alloc);
+  e = apr_bucket_immortal_create(META_SEP, sizeof(META_SEP) - 1, bucket_alloc);
   APR_BRIGADE_INSERT_TAIL(mobj->headers_bb, e);
-  
+
   if(r->headers_in) {
     apr_table_t *headers_in;
     apr_table_entry_t *elts;
@@ -364,7 +358,7 @@ static apr_status_t store_headers(cache_handle_t *h, request_rec *r,
     
     elts = (apr_table_entry_t *) apr_table_elts(headers_in)->elts;
     for( i = 0; i < apr_table_elts(headers_in)->nelts; i++) {
-      rv = _serialize(mobj->headers_bb, 
+      rv = _brigadize(mobj->headers_bb, 
                       "%s: %s\r\n",
                       elts[i].key, elts[i].val);
     }
@@ -645,7 +639,7 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog,
       (memcached_cache_conf_t *)ap_get_module_config(sp->module_config,
                                                      &memcached_cache_module);
 
-    rv = apr_memcache_create(p, DEFAULT_MAX_SERVERS, 0, &(conf->memcache));
+    rv = apr_memcache_create(p, conf->max_servers, 0, &(conf->memcache));
     if(rv != APR_SUCCESS) {
       ap_log_error(APLOG_MARK, APLOG_ERR, rv, sp, 
                    "Unable to create memcache struct");
@@ -656,8 +650,8 @@ static int post_config(apr_pool_t *p, apr_pool_t *plog,
     for(i = 0; i < conf->servers->nelts; i++) {
     
       rv = apr_memcache_server_create(p, svr[i].host, svr[i].port,
-                                      DEFAULT_MIN, DEFAULT_SMAX, DEFAULT_MAX,
-                                      DEFAULT_TTL,
+                                      conf->conn_min, conf->conn_smax, 
+                                      conf->conn_max, conf->conn_ttl,
                                       &(svr[i].server));
       if(rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, sp, 
@@ -688,7 +682,6 @@ static const command_rec memcached_cmds[] =
                 RSRC_CONF, 
                 "The maximum file size required to cache a document"),
 
-  
   AP_INIT_TAKE1("MemcachedMaxServers", set_mc_max_servers, NULL,
                 RSRC_CONF, 
                 "The maximum number of allowed cache servers"),
