@@ -1,0 +1,7 @@
+* apr_memcache reslist configs currently apply to all configured
+  servers. should they be per server, or ... finish mod_memcache and implement
+  support for that
+
+* enable separate server lists for meta data and body data?
+
+* enable optional split or all in one storage?
