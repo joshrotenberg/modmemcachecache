@@ -133,7 +133,8 @@ static int open_entity(cache_handle_t *h, request_rec *r, const char *key)
 
   info = &(obj->info);
 
-  /* look for the header and body items in the memcache server(s). if both
+  /* 
+     look for the header and body items in the memcache server(s). if both
      are not found this cached item isn't complete, return declined and
      let mod_cache decide what to do next.
   */
@@ -465,10 +466,8 @@ static apr_status_t store_body(cache_handle_t *h, request_rec *r,
 
 static apr_status_t recall_headers(cache_handle_t *h, request_rec *r)
 {
-  memcached_cache_conf_t *conf;
   cache_object_t *obj = h->cache_obj;
   memcached_cache_object_t *mobj = (memcached_cache_object_t *)obj->vobj;
-  apr_status_t rv;
 
   h->req_hdrs = apr_table_copy(r->pool, mobj->req_hdrs);
   h->resp_hdrs = apr_table_copy(r->pool, mobj->resp_hdrs);
